@@ -1,0 +1,151 @@
+name: Build 月影翻译 Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: "包含月影翻译源码的分支"
+        required: true
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref }}
+
+      - name: Locate 月影翻译 v0.6.1
+        shell: bash
+        run: |
+          set -euo pipefail
+          PROJECT_DIR="$(python3 - <<'PY'
+          from pathlib import Path
+          import re
+          for p in Path('.').rglob('pubspec.yaml'):
+              try:
+                  text = p.read_text(encoding='utf-8')
+              except Exception:
+                  continue
+              if re.search(r'^name:\s*moonshadow_translate\s*$', text, re.M) and re.search(r'^version:\s*0\.6\.1\+\d+\s*$', text, re.M):
+                  print(p.parent.as_posix())
+                  break
+          PY
+          )"
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "没有在分支 ${{ inputs.source_ref }} 找到 version: 0.6.1+* 的 moonshadow_translate 项目。" >&2
+            echo "仓库中的 pubspec.yaml：" >&2
+            find . -maxdepth 4 -name pubspec.yaml -print >&2 || true
+            exit 1
+          fi
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "找到项目：$PROJECT_DIR"
+          grep -E '^(name|version):' "$PROJECT_DIR/pubspec.yaml"
+          grep 'llama_flutter_android:' "$PROJECT_DIR/pubspec.yaml"
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter doctor
+        run: flutter doctor -v
+
+      - name: Setup Android SDK command-line tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Verify Android SDK tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-}"
+          which sdkmanager
+          sdkmanager --version
+
+      - name: Install Android NDK r27c and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - name: Generate Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter create --platforms=android --org com.moonshadow.translate --no-pub .
+
+      - name: Get dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter pub get
+
+      - name: Generate Android launcher icons
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          dart run flutter_launcher_icons -f tooling/flutter_launcher_icons_android.yaml
+
+      - name: Apply Android native patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          python3 tooling/apply_android_patch.py
+
+      - name: Verify source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          python3 tooling/verify_source.py
+          python3 tooling/preflight_android.py
+
+      - name: Analyze (non-blocking)
+        shell: bash
+        continue-on-error: true
+        run: |
+          cd "$PROJECT_DIR"
+          flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build release APK (ARM64)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$PROJECT_DIR"
+          flutter build apk --release --target-platform android-arm64
+
+      - name: Prepare APK artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifact
+          cp "$PROJECT_DIR/build/app/outputs/flutter-apk/app-release.apk" "artifact/月影翻译-Android-v0.6.1-arm64.apk"
+          ls -lh artifact/
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: 月影翻译-Android-v0.6.1
+          path: artifact/月影翻译-Android-v0.6.1-arm64.apk
+          if-no-files-found: error
